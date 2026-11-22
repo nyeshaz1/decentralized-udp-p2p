@@ -17,3 +17,6 @@ def test_bad_magic():
     b = bytearray(pack(Packet(MsgType.CHAT, 1)))
     b[0] = 0
     assert unpack(bytes(b)) is None
+def test_session_roundtrip():
+    p = Packet(MsgType.CHAT, 1, seq=1, session=77, payload=b"x")
+    assert unpack(pack(p)).session == 77    

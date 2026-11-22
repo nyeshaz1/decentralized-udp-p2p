@@ -14,7 +14,7 @@ class MsgType(IntEnum):
     FILE_MANIFEST = 0x30; CHUNK_STORE = 0x31; CHUNK_REQUEST = 0x32
     CHUNK_DATA = 0x33; CHUNK_ERROR = 0x34; REPLICA_UPDATE = 0x35
 
-F_RELIABLE, F_ACK_ONLY, F_MORE_FRAG, F_ENCRYPTED = 0x01, 0x02, 0x04, 0x08
+F_RELIABLE, F_MORE_FRAG = 0x01, 0x04   # bit1 and bit3 reserved
 
 @dataclass
 class Packet:
@@ -24,11 +24,12 @@ class Packet:
     ack: int = 0
     flags: int = 0
     payload: bytes = b""
+    session: int = 0
 
 def pack(p: Packet) -> bytes:
     if len(p.payload) > MAX_PAYLOAD:
         raise ValueError("payload too large")
-    hdr0 = struct.pack(_FMT, MAGIC, VERSION, p.type, p.flags, 0,
+    hdr0 = struct.pack(_FMT, MAGIC, VERSION, p.type, p.flags, p.session,
                        p.sender_id, p.seq, p.ack, len(p.payload), 0)
     crc = zlib.crc32(hdr0 + p.payload) & 0xFFFFFFFF
     return hdr0[:-4] + struct.pack(">I", crc) + p.payload
@@ -37,11 +38,11 @@ def unpack(data: bytes):
     """Return Packet or None if invalid (bad magic/version/length/CRC)."""
     if len(data) < HEADER_SIZE:
         return None
-    magic, ver, typ, flags, _r, sid, seq, ack, plen, crc = struct.unpack(_FMT, data[:HEADER_SIZE])
+    magic, ver, typ, flags, session, sid, seq, ack, plen, crc = struct.unpack(_FMT, data[:HEADER_SIZE])
     payload = data[HEADER_SIZE:]
     if magic != MAGIC or ver != VERSION or plen != len(payload):
         return None
     hdr0 = data[:HEADER_SIZE - 4] + b"\x00\x00\x00\x00"
     if zlib.crc32(hdr0 + payload) & 0xFFFFFFFF != crc:
         return None
-    return Packet(typ, sid, seq, ack, flags, payload)
+    return Packet(typ, sid, seq, ack, flags, payload, session)
