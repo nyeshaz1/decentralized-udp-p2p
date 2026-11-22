@@ -1,81 +1,16 @@
+# Decentralized UDP P2P Chat and File Sharing (CN Project)
 
-# Decentralized UDP-Based P2P Communication System
+Serverless, UDP-based group chat and distributed file storage with multi-source download.
+Team: Leader (nyeshaz1), Areesha, Hamza.
 
-## Project Overview
+## Run (filled in as modules land)
+    python -m venv .venv && source .venv/bin/activate
+    pip install -r requirements.txt
+    python scripts/gen_testfiles.py          # creates 2 files >= 2 MB in shared_files/
+    python -m p2p.cli --id 1 --port 5001     # first peer
+    python -m p2p.cli --id 2 --port 5002 --bootstrap 127.0.0.1:5001
 
-This project implements a decentralized, multi-party communication
-application using UDP sockets.
+## Tests
+    PYTHONPATH=src pytest -q
 
-Unlike traditional client-server applications, the system does not
-depend on a permanent central server or central storage.
-
-Every participant acts as both a client and a server, allowing peers
-to communicate, exchange files, and share storage responsibilities.
-
-## Objectives
-
-- Support at least four simultaneous peers.
-- Discover peers without a permanent central server.
-- Maintain active peer membership.
-- Provide reliable group chat over UDP.
-- Implement application-layer reliability.
-- Divide shared files into fixed-size chunks.
-- Distribute chunks across different peers.
-- Maintain at least two replicas of every chunk.
-- Support parallel multi-source downloads.
-- Recover from peer failures during downloads.
-- Verify file integrity using SHA-256.
-
-## Technology Stack
-
-| Component | Technology |
-|---|---|
-| Programming Language | Python 3 |
-| Transport Protocol | UDP |
-| Concurrency | Python threading |
-| Version Control | Git and GitHub |
-| File Integrity | SHA-256 |
-| Testing | Multi-process peer simulation |
-
-## Architecture
-
-The system follows a decentralized peer-to-peer architecture.
-
-Each peer independently maintains:
-- A peer membership table.
-- A chat message history.
-- A local chunk storage directory.
-- File and chunk metadata.
-- Active communication and transfer state.
-
-There is no permanent central coordinator.
-
-## Project Structure
-
-See the project directory structure and documentation
-in the `docs/` directory.
-
-## Documentation
-
-- [Project Roadmap](docs/ROADMAP.md)
-- [Protocol Specification](docs/PROTOCOL.md)
-- [System Architecture](docs/ARCHITECTURE.md)
-- [Design Decisions](docs/DESIGN_DECISIONS.md)
-
-## Development Status
-
-Current phase: Project Foundation and Protocol Design.
-
-Implementation has not started yet.
-
-## Team
-
-Three-member academic project.
-
-## Course
-
-Computer Networks
-
-## License
-
-Academic project.
+See docs/ for protocol, architecture, design decisions and roadmap.

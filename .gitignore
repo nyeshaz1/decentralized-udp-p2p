@@ -1,29 +1,9 @@
-# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-
-# Virtual environments
-venv/
+*.pyc
 .venv/
-env/
-
-# IDE
-.vscode/
 .idea/
-
-# Operating system
-.DS_Store
-Thumbs.db
-
-# Generated files
+.vscode/
+node_data/
+downloads/
+shared_files/*.bin
 *.log
-*.tmp
-
-# Downloaded/shared test files
-shared_files/*
-!shared_files/.gitkeep
-
-# Results generated during testing
-results/*
-!results/.gitkeep
