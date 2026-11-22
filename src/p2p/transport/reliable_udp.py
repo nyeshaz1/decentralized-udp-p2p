@@ -1,19 +1,49 @@
+import collections
 import logging
-import os
 import random
 import socket
+import struct
 import threading
 import time
 
 from p2p.common import config
 from p2p.common.interfaces import Transport
-from p2p.common.protocol import Packet, pack, unpack, MsgType
+from p2p.common.protocol import (Packet, pack, unpack, MsgType,
+                                 F_RELIABLE, F_MORE_FRAG)
 
 log = logging.getLogger("transport")
 
+MAX_LOGICAL = 256 * 1024
+RTO_FIXED = 1.0          # Monday: fixed timeout. Tuesday: RFC 6298.
+
+
+class _Entry:
+    """One sent-but-unacknowledged packet."""
+    def __init__(self, data, now):
+        self.data = data
+        self.first_sent = now
+        self.last_sent = now
+        self.retries = 0
+        self.retransmitted = False
+        self.sacked = False
+
+
+class _PeerState:
+    """Transport state for one remote address."""
+    def __init__(self):
+        self.session = 0
+        self.send_base = 1
+        self.next_seq = 1
+        self.unacked = {}                    # seq -> _Entry
+        self.queue = collections.deque()     # (type, flags, payload) waiting for window
+        self.recv_base = 1
+        self.recv_buf = {}                   # seq -> Packet
+        self.frag = bytearray()
+        self.rto = RTO_FIXED
+
 
 class ReliableUDP(Transport):
-    """UDP transport. Step 1: unreliable send/receive, broadcast, loss simulation."""
+    """UDP transport with Selective Repeat reliability (protocol.md section 4)."""
 
     def __init__(self, my_id, port, loss_rate=0.0, bind_ip="0.0.0.0", seed=None):
         self.my_id = my_id
@@ -25,6 +55,8 @@ class ReliableUDP(Transport):
         self._unreachable_cb = None
         self._running = False
         self._threads = []
+        self.lock = threading.RLock()
+        self.peers = {}                      # addr -> _PeerState
         self.stats = {"sent": 0, "retransmitted": 0, "bytes_delivered": 0}
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -45,7 +77,7 @@ class ReliableUDP(Transport):
             log.warning("[%s] cannot bind discovery port: %s", my_id, e)
             self.disc_sock = None
 
-    # ---- interface ----
+    # ---------------- public interface ----------------
     def register_handler(self, msg_type, handler):
         self.handlers[int(msg_type)] = handler
 
@@ -59,6 +91,9 @@ class ReliableUDP(Transport):
                 t = threading.Thread(target=self._recv_loop, args=(s,), daemon=True)
                 t.start()
                 self._threads.append(t)
+        t = threading.Thread(target=self._timer_loop, daemon=True)
+        t.start()
+        self._threads.append(t)
 
     def stop(self):
         self._running = False
@@ -79,9 +114,20 @@ class ReliableUDP(Transport):
         self._send_raw(("255.255.255.255", port), pack(pkt))
 
     def send_reliable(self, addr, msg_type, payload):
-        raise NotImplementedError("added in step 2")
+        """Ordered exactly-once delivery. Fragments payloads over 1024 bytes."""
+        if len(payload) > MAX_LOGICAL:
+            raise ValueError("message larger than 256 KiB")
+        addr = tuple(addr)
+        size = config.MAX_PAYLOAD
+        frags = [payload[i:i + size] for i in range(0, len(payload), size)] or [b""]
+        with self.lock:
+            st = self.peers.setdefault(addr, _PeerState())
+            for i, frag in enumerate(frags):
+                flags = F_RELIABLE | (F_MORE_FRAG if i < len(frags) - 1 else 0)
+                st.queue.append((int(msg_type), flags, frag))
+            self._pump(addr, st)
 
-    # ---- internals ----
+    # ---------------- sending side ----------------
     def _send_raw(self, addr, data):
         if self.loss_rate and self.rng.random() < self.loss_rate:
             return
@@ -91,6 +137,52 @@ class ReliableUDP(Transport):
         except OSError as e:
             log.debug("[%s] send error: %s", self.my_id, e)
 
+    def _pump(self, addr, st):
+        """Move queued packets into the window and send them. Call with lock held."""
+        while st.queue and st.next_seq < st.send_base + config.WINDOW:
+            mtype, flags, frag = st.queue.popleft()
+            pkt = Packet(mtype, self.my_id, seq=st.next_seq, ack=st.recv_base,
+                         flags=flags, payload=frag, session=self.session)
+            data = pack(pkt)
+            st.unacked[st.next_seq] = _Entry(data, time.monotonic())
+            st.next_seq += 1
+            self._send_raw(addr, data)
+
+    def _process_cum_ack(self, addr, st, ack):
+        """Remove everything below `ack` from the window. Lock held."""
+        if ack <= st.send_base:
+            return
+        for seq in [s for s in st.unacked if s < ack]:
+            del st.unacked[seq]
+        st.send_base = min(st.unacked) if st.unacked else max(st.next_seq, ack)
+        self._pump(addr, st)
+
+    def _handle_ack(self, addr, st, pkt):
+        self._process_cum_ack(addr, st, pkt.ack)
+        if len(pkt.payload) == 8:
+            base, bitmap = struct.unpack(">II", pkt.payload)
+            for i in range(32):
+                if bitmap & (1 << i):
+                    e = st.unacked.get(base + i)
+                    if e:
+                        e.sacked = True
+
+    def _timer_loop(self):
+        while self._running:
+            time.sleep(0.02)
+            now = time.monotonic()
+            with self.lock:
+                for addr, st in list(self.peers.items()):
+                    for seq, e in list(st.unacked.items()):
+                        if e.sacked or now - e.last_sent < st.rto:
+                            continue
+                        e.last_sent = now
+                        e.retries += 1
+                        e.retransmitted = True
+                        self.stats["retransmitted"] += 1
+                        self._send_raw(addr, e.data)
+
+    # ---------------- receiving side ----------------
     def _recv_loop(self, sock):
         while self._running:
             try:
@@ -106,13 +198,68 @@ class ReliableUDP(Transport):
                 continue
             if pkt.sender_id == self.my_id and pkt.type == MsgType.DISCOVER:
                 continue
-            self._on_packet(pkt, addr)
+            try:
+                self._on_packet(pkt, addr)
+            except Exception:
+                log.exception("[%s] packet processing error", self.my_id)
+
+    def _touch(self, addr, session):
+        """Get state for addr; reset it if the peer restarted (new session)."""
+        st = self.peers.get(addr)
+        if st is None:
+            st = self.peers[addr] = _PeerState()
+        if st.session == 0:
+            st.session = session
+        elif session != st.session:
+            log.info("[%s] session change from %s, resetting state", self.my_id, addr)
+            st = self.peers[addr] = _PeerState()
+            st.session = session
+        return st
 
     def _on_packet(self, pkt, addr):
-        if pkt.seq == 0 and not (pkt.flags & 0x01):
-            self._dispatch(pkt.sender_id, addr, pkt.type, pkt.payload)
+        deliveries = []
+        with self.lock:
+            st = self._touch(addr, pkt.session)
+            if pkt.type == MsgType.ACK:
+                self._handle_ack(addr, st, pkt)
+            elif pkt.flags & F_RELIABLE:
+                deliveries = self._handle_reliable(addr, st, pkt)
+            else:
+                deliveries = [(pkt.type, pkt.payload)]
+        for mtype, payload in deliveries:      # handlers run outside the lock
+            self._dispatch(pkt.sender_id, addr, mtype, payload)
+
+    def _handle_reliable(self, addr, st, pkt):
+        """Buffer, deliver in order, drop duplicates, ACK. Lock held."""
+        self._process_cum_ack(addr, st, pkt.ack)
+        out = []
+        seq = pkt.seq
+        if seq >= st.recv_base + config.WINDOW:
+            return out                          # outside window: drop
+        if seq >= st.recv_base and seq not in st.recv_buf:
+            st.recv_buf[seq] = pkt
+            while st.recv_base in st.recv_buf:
+                p = st.recv_buf.pop(st.recv_base)
+                st.recv_base += 1
+                st.frag.extend(p.payload)
+                if not (p.flags & F_MORE_FRAG):
+                    out.append((p.type, bytes(st.frag)))
+                    st.frag = bytearray()
+        self._send_ack(addr, st)                # ACK every reliable packet, even duplicates
+        return out
+
+    def _send_ack(self, addr, st):
+        base = st.recv_base + 1
+        bitmap = 0
+        for i in range(32):
+            if (base + i) in st.recv_buf:
+                bitmap |= 1 << i
+        pkt = Packet(MsgType.ACK, self.my_id, seq=0, ack=st.recv_base,
+                     payload=struct.pack(">II", base, bitmap), session=self.session)
+        self._send_raw(addr, pack(pkt))
 
     def _dispatch(self, sender_id, addr, msg_type, payload):
+        self.stats["bytes_delivered"] += len(payload)
         h = self.handlers.get(int(msg_type))
         if h is None:
             return
