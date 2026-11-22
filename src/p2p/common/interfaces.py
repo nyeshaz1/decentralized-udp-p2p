@@ -20,6 +20,9 @@ class Transport(ABC):
     def start(self) -> None: ...
     @abstractmethod
     def stop(self) -> None: ...
+    def set_unreachable_handler(self, cb) -> None:
+        """cb(addr) is called when a peer exceeds MAX_RETRIES (treated as FAILED)."""
+        self._unreachable_cb = cb
 
 class MembershipView(ABC):
     """Implemented by membership/ (Areesha), used by storage/transfer (Hamza)."""
