@@ -1,6 +1,9 @@
 
 import os
 import time
+import socket
+import struct
+from p2p.common.protocol import Packet, pack, unpack, F_RELIABLE
 from p2p.transport.reliable_udp import ReliableUDP
 from p2p.common.protocol import MsgType
 from p2p.common import config
@@ -92,3 +95,48 @@ def test_unreachable_callback(monkeypatch):
         assert ("127.0.0.1", 47049) not in a.peers  # state dropped
     finally:
         a.stop()
+def test_duplicate_packet_delivered_once():
+    b = ReliableUDP(2, 47051); b.start()
+    got = []
+    b.register_handler(MsgType.CHAT, lambda s, ad, t, p: got.append(p))
+    raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    pkt = pack(Packet(MsgType.CHAT, 9, seq=1, flags=F_RELIABLE, payload=b"once", session=5))
+    try:
+        raw.sendto(pkt, ("127.0.0.1", 47051))
+        raw.sendto(pkt, ("127.0.0.1", 47051))
+        assert wait_until(lambda: len(got) >= 1)
+        time.sleep(0.5)
+        assert got == [b"once"]
+    finally:
+        raw.close(); b.stop()
+
+
+def test_session_change_resets_state():
+    b = ReliableUDP(2, 47052); b.start()
+    got = []
+    b.register_handler(MsgType.CHAT, lambda s, ad, t, p: got.append(p))
+    raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        raw.sendto(pack(Packet(MsgType.CHAT, 9, seq=1, flags=F_RELIABLE, payload=b"old", session=5)), ("127.0.0.1", 47052))
+        assert wait_until(lambda: len(got) == 1)
+        raw.sendto(pack(Packet(MsgType.CHAT, 9, seq=1, flags=F_RELIABLE, payload=b"new", session=6)), ("127.0.0.1", 47052))
+        assert wait_until(lambda: len(got) == 2)
+        assert got == [b"old", b"new"]
+    finally:
+        raw.close(); b.stop()
+
+
+def test_sack_in_ack():
+    b = ReliableUDP(2, 47053); b.start()
+    raw = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    raw.bind(("127.0.0.1", 47063))
+    raw.settimeout(3)
+    try:
+        # seq 1 is "lost"; send seq 2
+        raw.sendto(pack(Packet(MsgType.CHAT, 9, seq=2, flags=F_RELIABLE, payload=b"x", session=5)), ("127.0.0.1", 47053))
+        p = unpack(raw.recvfrom(2048)[0])
+        assert p.type == MsgType.ACK and p.ack == 1
+        base, bitmap = struct.unpack(">II", p.payload)
+        assert base == 2 and bitmap & 1
+    finally:
+        raw.close(); b.stop()
