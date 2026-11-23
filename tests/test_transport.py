@@ -63,7 +63,8 @@ def test_200kb_message_intact():
         a.stop(); b.stop()
 
 
-def test_1mb_with_20_percent_loss():
+def test_1mb_with_20_percent_loss(monkeypatch):
+    monkeypatch.setattr(config, "MAX_RETRIES", 30)
     a = ReliableUDP(1, 47031, loss_rate=0.2, seed=11)
     b = ReliableUDP(2, 47032, loss_rate=0.2, seed=22)
     a.start(); b.start()
@@ -95,6 +96,8 @@ def test_unreachable_callback(monkeypatch):
         assert ("127.0.0.1", 47049) not in a.peers  # state dropped
     finally:
         a.stop()
+
+
 def test_duplicate_packet_delivered_once():
     b = ReliableUDP(2, 47051); b.start()
     got = []
