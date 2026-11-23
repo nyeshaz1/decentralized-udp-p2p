@@ -3,6 +3,7 @@ import os
 import time
 from p2p.transport.reliable_udp import ReliableUDP
 from p2p.common.protocol import MsgType
+from p2p.common import config
 
 
 def wait_until(cond, timeout=10.0):
@@ -74,3 +75,20 @@ def test_1mb_with_20_percent_loss():
         assert a.stats["retransmitted"] > 0
     finally:
         a.stop(); b.stop()
+
+
+def test_unreachable_callback(monkeypatch):
+    monkeypatch.setattr(config, "RTO_MIN", 0.05)
+    monkeypatch.setattr(config, "RTO_MAX", 0.2)
+    a = ReliableUDP(1, 47041)
+    a.start()
+    dead = []
+    a.set_unreachable_handler(lambda addr: dead.append(addr))
+    try:
+        a.send_reliable(("127.0.0.1", 47049), MsgType.CHAT, b"anyone?")   # nobody listens
+        assert wait_until(lambda: len(dead) == 1, timeout=20)
+        time.sleep(1)
+        assert dead == [("127.0.0.1", 47049)]       # called exactly once
+        assert ("127.0.0.1", 47049) not in a.peers  # state dropped
+    finally:
+        a.stop()

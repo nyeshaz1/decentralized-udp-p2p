@@ -1,3 +1,4 @@
+
 import collections
 import logging
 import random
@@ -168,6 +169,8 @@ class ReliableUDP(Transport):
         now = time.monotonic()
         newly = sorted(s for s in st.unacked if s < ack)
         entries = [st.unacked.pop(s) for s in newly]
+        for e in st.unacked.values():     # peer is alive: restart retry counting
+            e.retries = 0
         clean = bool(entries) and all(
             not e.retransmitted and not e.sacked for e in entries)
         if clean:
@@ -193,6 +196,8 @@ class ReliableUDP(Transport):
     def _handle_ack(self, addr, st, pkt):
         self._process_cum_ack(addr, st, pkt.ack)
         if len(pkt.payload) == 8:
+            for e in st.unacked.values():
+                e.retries = 0
             base, bitmap = struct.unpack(">II", pkt.payload)
             for i in range(32):
                 if bitmap & (1 << i):
@@ -215,12 +220,16 @@ class ReliableUDP(Transport):
         while self._running:
             time.sleep(0.02)
             now = time.monotonic()
+            dead = []
             with self.lock:
                 for addr, st in list(self.peers.items()):
                     backoff = False
                     for seq, e in list(st.unacked.items()):
                         if e.sacked or now - e.last_sent < st.rto:
                             continue
+                        if e.retries >= config.MAX_RETRIES:
+                            dead.append(addr)
+                            break
                         e.last_sent = now
                         e.retries += 1
                         e.retransmitted = True
@@ -230,6 +239,15 @@ class ReliableUDP(Transport):
                             backoff = True
                     if backoff:
                         st.rto = min(config.RTO_MAX, st.rto * 2)
+                for addr in dead:
+                    self.peers.pop(addr, None)      # drop all state for that peer
+            for addr in dead:                        # callback runs outside the lock
+                log.warning("[%s] peer %s unreachable", self.my_id, addr)
+                if self._unreachable_cb:
+                    try:
+                        self._unreachable_cb(addr)
+                    except Exception:
+                        log.exception("[%s] unreachable callback error", self.my_id)
 
     # ---------------- receiving side ----------------
 
@@ -238,6 +256,8 @@ class ReliableUDP(Transport):
             try:
                 data, addr = sock.recvfrom(2048)
             except socket.timeout:
+                continue
+            except ConnectionResetError:     # Windows: ICMP "port unreachable"
                 continue
             except OSError:
                 break
