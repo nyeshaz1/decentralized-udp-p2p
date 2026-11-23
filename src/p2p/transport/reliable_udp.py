@@ -8,8 +8,9 @@ import time
 
 from p2p.common import config
 from p2p.common.interfaces import Transport
-from p2p.common.protocol import (Packet, pack, unpack, MsgType,
-                                 F_RELIABLE, F_MORE_FRAG)
+from p2p.common.protocol import (
+    Packet, pack, unpack, MsgType, F_RELIABLE, F_MORE_FRAG
+)
 
 log = logging.getLogger("transport")
 
@@ -19,6 +20,7 @@ RTO_FIXED = 1.0          # Monday: fixed timeout. Tuesday: RFC 6298.
 
 class _Entry:
     """One sent-but-unacknowledged packet."""
+
     def __init__(self, data, now):
         self.data = data
         self.first_sent = now
@@ -26,10 +28,12 @@ class _Entry:
         self.retries = 0
         self.retransmitted = False
         self.sacked = False
+        self.dupcount = 0
 
 
 class _PeerState:
     """Transport state for one remote address."""
+
     def __init__(self):
         self.session = 0
         self.send_base = 1
@@ -39,7 +43,12 @@ class _PeerState:
         self.recv_base = 1
         self.recv_buf = {}                   # seq -> Packet
         self.frag = bytearray()
-        self.rto = RTO_FIXED
+
+        # self.rto = RTO_FIXED fixed 1 seconnd makes code slow
+        #fixed 1s timer cases slownedd
+        self.rto = 1.0
+        self.srtt = None
+        self.rttvar = None
 
 
 class ReliableUDP(Transport):
@@ -78,6 +87,7 @@ class ReliableUDP(Transport):
             self.disc_sock = None
 
     # ---------------- public interface ----------------
+
     def register_handler(self, msg_type, handler):
         self.handlers[int(msg_type)] = handler
 
@@ -117,9 +127,11 @@ class ReliableUDP(Transport):
         """Ordered exactly-once delivery. Fragments payloads over 1024 bytes."""
         if len(payload) > MAX_LOGICAL:
             raise ValueError("message larger than 256 KiB")
+
         addr = tuple(addr)
         size = config.MAX_PAYLOAD
         frags = [payload[i:i + size] for i in range(0, len(payload), size)] or [b""]
+
         with self.lock:
             st = self.peers.setdefault(addr, _PeerState())
             for i, frag in enumerate(frags):
@@ -128,6 +140,7 @@ class ReliableUDP(Transport):
             self._pump(addr, st)
 
     # ---------------- sending side ----------------
+
     def _send_raw(self, addr, data):
         if self.loss_rate and self.rng.random() < self.loss_rate:
             return
@@ -152,10 +165,30 @@ class ReliableUDP(Transport):
         """Remove everything below `ack` from the window. Lock held."""
         if ack <= st.send_base:
             return
-        for seq in [s for s in st.unacked if s < ack]:
-            del st.unacked[seq]
+        now = time.monotonic()
+        newly = sorted(s for s in st.unacked if s < ack)
+        entries = [st.unacked.pop(s) for s in newly]
+        clean = bool(entries) and all(
+            not e.retransmitted and not e.sacked for e in entries)
+        if clean:
+            self._update_rtt(st, now - entries[-1].last_sent)
+        elif st.srtt is not None:
+            # progress was made: drop any backoff, go back to the measured RTO
+            st.rto = min(config.RTO_MAX,
+                         max(config.RTO_MIN, st.srtt + 4 * st.rttvar))
         st.send_base = min(st.unacked) if st.unacked else max(st.next_seq, ack)
         self._pump(addr, st)
+
+    def _update_rtt(self, st, sample):
+        """RFC 6298: update SRTT/RTTVAR and RTO from one RTT sample."""
+        if st.srtt is None:
+            st.srtt = sample
+            st.rttvar = sample / 2
+        else:
+            st.rttvar = 0.75 * st.rttvar + 0.25 * abs(st.srtt - sample)
+            st.srtt = 0.875 * st.srtt + 0.125 * sample
+
+        st.rto = min(config.RTO_MAX, max(config.RTO_MIN, st.srtt + 4 * st.rttvar))
 
     def _handle_ack(self, addr, st, pkt):
         self._process_cum_ack(addr, st, pkt.ack)
@@ -166,6 +199,17 @@ class ReliableUDP(Transport):
                     e = st.unacked.get(base + i)
                     if e:
                         e.sacked = True
+            # fast retransmit: 3+ packets after the oldest were SACKed
+            first = st.unacked.get(st.send_base)
+            if first is not None and not first.sacked:
+                sacked_after = sum(1 for e in st.unacked.values() if e.sacked)
+                if sacked_after >= 3:
+                    now = time.monotonic()
+                    if now - first.last_sent > 0.05:     # avoid resending too often
+                        first.last_sent = now
+                        first.retransmitted = True
+                        self.stats["retransmitted"] += 1
+                        self._send_raw(addr, first.data)
 
     def _timer_loop(self):
         while self._running:
@@ -173,6 +217,7 @@ class ReliableUDP(Transport):
             now = time.monotonic()
             with self.lock:
                 for addr, st in list(self.peers.items()):
+                    backoff = False
                     for seq, e in list(st.unacked.items()):
                         if e.sacked or now - e.last_sent < st.rto:
                             continue
@@ -181,8 +226,13 @@ class ReliableUDP(Transport):
                         e.retransmitted = True
                         self.stats["retransmitted"] += 1
                         self._send_raw(addr, e.data)
+                        if seq == st.send_base:
+                            backoff = True
+                    if backoff:
+                        st.rto = min(config.RTO_MAX, st.rto * 2)
 
     # ---------------- receiving side ----------------
+
     def _recv_loop(self, sock):
         while self._running:
             try:
@@ -191,13 +241,17 @@ class ReliableUDP(Transport):
                 continue
             except OSError:
                 break
+
             if self.loss_rate and self.rng.random() < self.loss_rate:
                 continue
+
             pkt = unpack(data)
             if pkt is None:
                 continue
+
             if pkt.sender_id == self.my_id and pkt.type == MsgType.DISCOVER:
                 continue
+
             try:
                 self._on_packet(pkt, addr)
             except Exception:
@@ -208,12 +262,14 @@ class ReliableUDP(Transport):
         st = self.peers.get(addr)
         if st is None:
             st = self.peers[addr] = _PeerState()
+
         if st.session == 0:
             st.session = session
         elif session != st.session:
             log.info("[%s] session change from %s, resetting state", self.my_id, addr)
             st = self.peers[addr] = _PeerState()
             st.session = session
+
         return st
 
     def _on_packet(self, pkt, addr):
@@ -226,6 +282,7 @@ class ReliableUDP(Transport):
                 deliveries = self._handle_reliable(addr, st, pkt)
             else:
                 deliveries = [(pkt.type, pkt.payload)]
+
         for mtype, payload in deliveries:      # handlers run outside the lock
             self._dispatch(pkt.sender_id, addr, mtype, payload)
 
@@ -234,8 +291,10 @@ class ReliableUDP(Transport):
         self._process_cum_ack(addr, st, pkt.ack)
         out = []
         seq = pkt.seq
+
         if seq >= st.recv_base + config.WINDOW:
             return out                          # outside window: drop
+
         if seq >= st.recv_base and seq not in st.recv_buf:
             st.recv_buf[seq] = pkt
             while st.recv_base in st.recv_buf:
@@ -245,6 +304,7 @@ class ReliableUDP(Transport):
                 if not (p.flags & F_MORE_FRAG):
                     out.append((p.type, bytes(st.frag)))
                     st.frag = bytearray()
+
         self._send_ack(addr, st)                # ACK every reliable packet, even duplicates
         return out
 
@@ -254,6 +314,7 @@ class ReliableUDP(Transport):
         for i in range(32):
             if (base + i) in st.recv_buf:
                 bitmap |= 1 << i
+
         pkt = Packet(MsgType.ACK, self.my_id, seq=0, ack=st.recv_base,
                      payload=struct.pack(">II", base, bitmap), session=self.session)
         self._send_raw(addr, pack(pkt))

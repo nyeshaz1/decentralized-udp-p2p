@@ -82,3 +82,5 @@ class FakeTransport(Transport):
         """Simulate a crash: stops sending and receiving, no LEAVE."""
         self.dead = True
         self._running = False
+
+
