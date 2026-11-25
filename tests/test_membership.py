@@ -1,7 +1,13 @@
 """Tests for membership payload codecs (Task A1) against hand-built bytes."""
+import threading
+import time
+
 import pytest
 
+from p2p.common.protocol import MsgType
 from p2p.membership import messages as m
+from p2p.membership.membership import Membership, MembershipError
+from fake_transport import FakeNetwork
 
 FID = bytes(range(16))          # 00 01 02 ... 0f
 
@@ -144,3 +150,194 @@ def test_short_payloads_rejected():
         m.decode_member_update(b"\x01\x00")
     with pytest.raises(ValueError):
         m.decode_heartbeat(b"\x00\x00")
+
+
+# =====================================================================
+# Membership service tests (Task A2) using FakeNetwork
+# =====================================================================
+FAST = dict(heartbeat_interval=0.1, peer_timeout=0.6)
+LOCAL = "127.0.0.1"
+
+
+@pytest.fixture(autouse=True)
+def fast_timers(monkeypatch):
+    """Shorten discovery/join/leave waits so tests run in a second or two."""
+    monkeypatch.setattr(Membership, "DISCOVER_INTERVAL", 0.1)
+    monkeypatch.setattr(Membership, "JOIN_TIMEOUT", 2.0)
+    monkeypatch.setattr(Membership, "LEAVE_WAIT", 0.05)
+
+
+@pytest.fixture
+def nodes():
+    """Collects started nodes and stops them at the end of the test."""
+    created = []
+    yield created
+    for n in created:
+        n.m.stop()
+        n.t.stop()
+
+
+class Node:
+    """A Membership plus its fake transport and a log of on_change events."""
+
+    def __init__(self, net, pid, port, bootstrap=None, **kw):
+        self.pid, self.port = pid, port
+        self.t = net.create(pid, port)
+        self.t.start()
+        opts = dict(FAST)
+        opts.update(kw)
+        self.m = Membership(self.t, pid, port, name=f"n{pid}", bootstrap=bootstrap, **opts)
+        self.events = []
+        self.m.on_change(lambda e, p: self.events.append((e, p)))
+        self.m.start()
+
+    def count(self, event, pid):
+        return self.events.count((event, pid))
+
+
+def wait_until(cond, timeout=5.0, step=0.02):
+    """Poll cond() until true or timeout; return the final value."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(step)
+    return cond()
+
+
+def start_group(net, nodes, n, use_bootstrap, **kw):
+    """Start peer 1 alone, then peers 2..n joining via bootstrap or broadcast."""
+    first = Node(net, 1, 5001, **kw)
+    nodes.append(first)
+    first.m.join()
+    for pid in range(2, n + 1):
+        boot = (LOCAL, 5001) if use_bootstrap else None
+        node = Node(net, pid, 5000 + pid, bootstrap=boot, **kw)
+        nodes.append(node)
+        node.m.join()
+    return nodes[-n:]
+
+
+def converged(group):
+    ids = {n.pid for n in group}
+    return all(set(n.m.alive_peers()) == ids - {n.pid} for n in group)
+
+
+def test_four_peers_converge_via_bootstrap(nodes):
+    group = start_group(FakeNetwork(), nodes, 4, use_bootstrap=True)
+    assert wait_until(lambda: converged(group), 5.0)
+    assert group[0].m.alive_peers()[2] == (LOCAL, 5002)
+    assert group[3].m.peer_name(1) == "n1"
+    # on_change events are delivered asynchronously: wait for them, then
+    # check that each join was reported exactly once (no duplicates).
+    def all_joins_seen():
+        return all(n.count("join", o.pid) >= 1
+                   for n in group for o in group if o is not n)
+    assert wait_until(all_joins_seen, 3.0)
+    time.sleep(0.3)
+    for n in group:
+        for other in group:
+            if other is not n:
+                assert n.count("join", other.pid) == 1
+
+
+def test_four_peers_converge_via_broadcast_discover(nodes):
+    group = start_group(FakeNetwork(), nodes, 4, use_bootstrap=False)
+    assert wait_until(lambda: converged(group), 5.0)
+
+
+def test_first_peer_runs_alone_when_nobody_answers(nodes):
+    solo = Node(FakeNetwork(), 1, 5001)
+    nodes.append(solo)
+    solo.m.join()
+    assert solo.m.alive_peers() == {}
+
+
+def test_crashed_peer_detected_by_everyone(nodes):
+    group = start_group(FakeNetwork(), nodes, 4, use_bootstrap=True)
+    assert wait_until(lambda: converged(group), 5.0)
+    group[3].t.kill()                                # peer 4 crashes, no LEAVE
+    survivors = group[:3]
+    limit = FAST["peer_timeout"] + 2.0
+    assert wait_until(lambda: all(n.count("fail", 4) >= 1 for n in survivors), limit)
+    time.sleep(0.5)                                  # let gossip arrive
+    for n in survivors:
+        assert n.count("fail", 4) == 1               # idempotent: exactly once
+        assert 4 not in n.m.alive_peers()
+        assert len(n.m.alive_peers()) == 2
+
+
+def test_graceful_leave_fires_leave_immediately(nodes):
+    group = start_group(FakeNetwork(), nodes, 3, use_bootstrap=True)
+    assert wait_until(lambda: converged(group), 5.0)
+    group[2].m.leave()
+    assert wait_until(lambda: all(n.count("leave", 3) == 1 for n in group[:2]), 1.0)
+    for n in group[:2]:
+        assert n.count("fail", 3) == 0
+        assert 3 not in n.m.alive_peers()
+
+
+def test_duplicate_id_rejected(nodes):
+    net = FakeNetwork()
+    a = Node(net, 1, 5001)
+    nodes.append(a)
+    a.m.join()
+    b = Node(net, 2, 5002, bootstrap=(LOCAL, 5001))
+    nodes.append(b)
+    b.m.join()
+    dup_of_b = Node(net, 2, 5003, bootstrap=(LOCAL, 5001))
+    nodes.append(dup_of_b)
+    with pytest.raises(MembershipError):
+        dup_of_b.m.join()
+    dup_of_a = Node(net, 1, 5004, bootstrap=(LOCAL, 5001))
+    nodes.append(dup_of_a)
+    with pytest.raises(MembershipError):
+        dup_of_a.m.join()
+    assert a.m.alive_peers() == {2: (LOCAL, 5002)}   # table untouched
+
+
+def test_bootstrap_unreachable_raises(nodes, monkeypatch):
+    monkeypatch.setattr(Membership, "JOIN_TIMEOUT", 0.3)
+    n = Node(FakeNetwork(), 1, 5001, bootstrap=(LOCAL, 5999))
+    nodes.append(n)
+    with pytest.raises(MembershipError, match="bootstrap unreachable"):
+        n.m.join()
+
+
+def test_state_provider_data_reaches_joiner_consumer(nodes):
+    net = FakeNetwork()
+    fid = bytes(range(16))
+    a = Node(net, 1, 5001)
+    nodes.append(a)
+    a.m.state_provider = lambda: ([b"manifest-1"], [(fid, 3, [1])])
+    a.m.join()
+    got = []
+    b = Node(net, 2, 5002, bootstrap=(LOCAL, 5001))
+    nodes.append(b)
+    b.m.state_consumer = lambda manifests, chunk_map: got.append((manifests, chunk_map))
+    b.m.join()
+    assert got == [([b"manifest-1"], [(fid, 3, [1])])]
+
+
+def test_heartbeat_from_unknown_peer_is_ignored(nodes):
+    net = FakeNetwork()
+    a = Node(net, 1, 5001)
+    nodes.append(a)
+    stranger = net.create(9, 5009)
+    stranger.start()
+    stranger.send_unreliable((LOCAL, 5001), MsgType.HEARTBEAT, m.encode_heartbeat(1))
+    time.sleep(0.3)
+    assert a.m.alive_peers() == {}
+
+
+def test_30_percent_heartbeat_loss_causes_no_false_failures(nodes):
+    # 10:1 timeout/interval ratio. (With the default 5:1 ratio a run of 5 lost
+    # heartbeats happens by chance about 0.24% of the time at 30% loss.)
+    net = FakeNetwork(loss=0.3, seed=7)
+    group = start_group(net, nodes, 4, use_bootstrap=True,
+                        heartbeat_interval=0.05, peer_timeout=0.5)
+    assert wait_until(lambda: converged(group), 5.0)
+    time.sleep(3.0)                                  # ~60 heartbeats per pair
+    assert converged(group)
+    for n in group:
+        assert not [e for e in n.events if e[0] in ("fail", "leave")]
