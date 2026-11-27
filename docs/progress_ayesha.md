@@ -109,3 +109,20 @@ Result: 1 MB at 20% loss went from 100+ s (and failing) to about 30 s.
 - Sun 22: setup complete, transport steps 0 to 4 done, 9 tests passing.
 - Mon 23: transport reliable path (ACK/SACK, reassembly, fixed RTO), tests added.
 - Tue 24: T1 to T6 done, 14 tests; fixes listed in section 3; answered Areesha's 5 questions; PRs from Areesha and Hamza not yet received.
+
+
+
+
+
+## Status at end of Fri 27 Nov
+- node.py, cli.py and tests/test_node.py done, merged into develop (aa7e81f).
+- Areesha's membership + chat PR merged; 65 tests passed on develop.
+- scripts/run_local.ps1 done. First multi-peer run on one laptop: peer list correct, group chat works, private message works, crash detection works (closed a window, peer removed from /peers within seconds).
+- Cosmetic: the "> " prompt is not redrawn after an incoming message (harmless, skipped).
+- Waiting on Hamza's PR (storage + transfer). File commands (/share /files /download /chunks) are wired in node.py and activate automatically once his modules are merged.
+
+## Next
+1. Review Hamza's PR: run his tests, check he touched only storage/ and transfer/, merge to develop, sync my branch.
+2. Run 4 peers, share a file, download it, kill a source mid-download.
+3. Experiments (loss 0/5/10/20 %, chunk size, failover time), set config.MAX_RETRIES = 30 in the script.
+4. Report, diagrams, graphs (Sat), develop -> main, zip, rehearsal (Sun).
